@@ -201,12 +201,30 @@ def get_volume(module, ec2):
     name = module.params.get('name')
     id = module.params.get('id')
     zone = module.params.get('zone')
+    instance = module.params.get('instance')
+    volume_size = module.params.get('volume_size')
+    device_name = module.params.get('device_name')
+    iops = module.params.get('iops')
+    encrypted = module.params.get('encrypted')
+    snapshot = module.params.get('snapshot')
     filters = {}
     volume_ids = None
     if zone:
         filters['availability_zone'] = zone
     if name:
         filters = {'tag:Name': name}
+    if device_name:
+        filters['attachment.device'] = device_name
+    if volume_size:
+        filters['size'] = volume_size
+    if encrypted:
+        filters['encrypted'] = encrypted
+    if snapshot:
+        filters['snapshot-id'] = snapshot
+    if instance and instance != "None":
+        filters['attachment.instance-id'] = instance
+    if iops:
+        filters['volume-type'] = 'io1'
     if id:
         volume_ids = [id]
     try:
