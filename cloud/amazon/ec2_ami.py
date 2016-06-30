@@ -88,6 +88,45 @@ options:
     required: false
     default: null
     version_added: "2.0"
+  snapshot_id:
+    description:
+      - the snapshot ID from which the image will be created. Use as an alternative to instance_id
+    required: false
+    default: null
+    version_added: "2.2"
+  architecture:
+    description:
+      - Architecture of the AMI. Required if using 'snapshot_id'.  Valid choices are 'i386' and 'x86_64'
+    required: false
+    default: null
+    version_added: "2.2"
+  kernel_id:
+    description:
+      - ID of the kernel to launch the instances with. Required if using 'snapshot_id'.
+    required: false
+    version_added: "2.2"
+  root_device_name:
+    description:
+      - root device name. Required if using 'snapshot_id'. Valid choices are '/dev/sda1' and '/dev/xvda'.
+    required: false
+    version_added: "2.2"
+  virtualization_type:
+    description:
+      - virutalization_type of the image. Required if using 'snapshot_id'.  Valid choices are 'paravirtual' and 'hvm'.
+    required: false
+    version_added: "2.2"
+  sriov_net_support:
+    description:
+      - advanced networking support. Required if using 'snapshot_id'.  Valid choices are 'simple'.
+    required: false
+    version_added: "2.2"
+  delete_root_volume_on_termination:
+    description:
+      - whether to delete the root volume of the image after instance termination. Required if using 'snapshot_id'. Defaults to False. Note that leaving volumes behind after instance termination is not free.
+    required: false
+    default: null
+    version_added: "2.2"
+
 author:
     - "Evan Duffield (@scicoin-project) <eduffield@iacquire.com>"
     - "Constantin Bugneac (@Constantin07) <constantin.bugneac@endava.com>"
@@ -190,6 +229,44 @@ EXAMPLES = '''
     state: present
     launch_permissions:
       user_ids: ['123456789012']
+
+# AMI Creation, with a custom root-device size and another EBS attached
+- ec2_ami
+    aws_access_key: xxxxxxxxxxxxxxxxxxxxxxx
+    aws_secret_key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    region: xxxxxx
+    instance_id: i-xxxxxx
+    name: newtest
+    device_mapping:
+        - device_name: /dev/sda1
+          size: XXX
+          delete_on_termination: true
+          volume_type: gp2
+        - device_name: /dev/sdb
+          size: YYY
+          delete_on_termination: false
+          volume_type: gp2
+  register: instance
+
+# Create AMI by registering an existing volume snapshot
+- ec2_ami:
+    aws_access_key: xxxxxxxxxxxxxxxxxxxxxxx
+    aws_secret_key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    region: xxxxxx
+    snapshot_id: i-xxxxxx
+    wait: yes
+    name: image name
+    architecture: x86_64
+    kernel_id = aki-abcd1234
+    root_device_name = /dev/sda
+    virtualization_type = hvm
+    sriov_net_support = simple
+    delete_root_volume_on_termination = True
+    tags:
+      Name: image name
+      Service: TestService
+  register: instance
+
 '''
 
 RETURN = '''
@@ -300,6 +377,31 @@ try:
 except ImportError:
     HAS_BOTO = False
 
+
+def create_block_device(module, ec2, volume):
+    # Not aware of a way to determine this programatically
+    # http://aws.amazon.com/about-aws/whats-new/2013/10/09/ebs-provisioned-iops-maximum-iops-gb-ratio-increased-to-30-1/
+    MAX_IOPS_TO_SIZE_RATIO = 30
+    if 'snapshot' not in volume and 'ephemeral' not in volume:
+        if 'volume_size' not in volume:
+            module.fail_json(msg = 'Size must be specified when creating a new volume or modifying the root volume')
+    if 'snapshot' in volume:
+        if 'device_type' in volume and volume.get('device_type') == 'io1' and 'iops' not in volume:
+            module.fail_json(msg = 'io1 volumes must have an iops value set')
+        if 'iops' in volume:
+            snapshot = ec2.get_all_snapshots(snapshot_ids=[volume['snapshot']])[0]
+            size = volume.get('volume_size', snapshot.volume_size)
+            if int(volume['iops']) > MAX_IOPS_TO_SIZE_RATIO * size:
+                module.fail_json(msg = 'IOPS must be at most %d times greater than size' % MAX_IOPS_TO_SIZE_RATIO)
+    if 'ephemeral' in volume:
+        if 'snapshot' in volume:
+            module.fail_json(msg = 'Cannot set both ephemeral and snapshot')
+    return BlockDeviceType(snapshot_id=volume.get('snapshot'),
+                            ephemeral_name=volume.get('ephemeral'),
+                            size=volume.get('volume_size'),
+                            volume_type=volume.get('device_type'),
+                            delete_on_termination=volume.get('delete_on_termination', False),
+                            iops=volume.get('iops'))
 
 def get_block_device_mapping(image):
     """
@@ -506,6 +608,88 @@ def update_image(module, ec2):
     except boto.exception.BotoServerError as e:
         module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
 
+
+def register_image(module, ec2):
+    """
+    Creates new AMI based on existing volume snapshot id
+
+    module : AnsibleModule object
+    ec2: authenticated ec2 connection object
+    """
+
+    name = module.params.get('name')
+    wait = module.params.get('wait')
+    wait_timeout = int(module.params.get('wait_timeout'))
+    description = module.params.get('description')
+    tags =  module.params.get('tags')
+    snapshot_id = module.params.get('snapshot_id')
+    architecture = module.params.get('architecture')
+    kernel_id = module.params.get('kernel_id')
+    root_device_name = module.params.get('root_device_name')
+    volumes = module.params.get('volumes')
+    virtualization_type = module.params.get('virtualization_type')
+    sriov_net_support = module.params.get('sriov_net_support')
+    delete_root_volume_on_termination = module.params.get('delete_root_volume_on_termination')
+
+    try:
+        params = {'name': name,
+                  'description': description,
+                  'architecture': architecture,
+                  'kernel_id': kernel_id,
+                  'root_device_name': root_device_name,
+                  'virtualization_type': virtualization_type,
+                  'sriov_net_support': sriov_net_support,
+                  'delete_root_volume_on_termination': delete_root_volume_on_termination}
+
+        if volumes:
+            bdm = BlockDeviceMapping()
+            for volume in volumes:
+                if 'device_name' not in volume:
+                    module.fail_json(msg = 'Device name must be set for volume')
+                # Minimum volume size is 1GB. We'll use volume size explicitly set to 0
+                # to be a signal not to create this volume
+                if 'volume_size' not in volume or int(volume['volume_size']) > 0:
+                    bdm[volume['device_name']] = create_block_device(module, ec2, volume)
+            params['block_device_map'] = bdm
+
+
+        image_id = ec2.register_image(**params)
+    except boto.exception.BotoServerError as e:
+        module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
+
+    # Wait until the image is recognized. EC2 API has eventual consistency,
+    # such that a successful CreateImage API call doesn't guarantee the success
+    # of subsequent DescribeImages API call using the new image id returned.
+    for i in range(wait_timeout):
+        try:
+            img = ec2.get_image(image_id)
+            break
+        except boto.exception.EC2ResponseError as e:
+            if 'InvalidAMIID.NotFound' in e.error_code and wait:
+                time.sleep(1)
+            else:
+                module.fail_json(msg="Error while trying to find the new image. Using wait=yes and/or a longer wait_timeout may help.")
+    else:
+        module.fail_json(msg="timed out waiting for image to be recognized")
+
+    # wait here until the image is created
+    wait_timeout = time.time() + wait_timeout
+    while wait and wait_timeout > time.time() and (img is None or img.state != 'available'):
+        img = ec2.get_image(image_id)
+        time.sleep(3)
+    if wait and wait_timeout <= time.time():
+        # waiting took too long
+        module.fail_json(msg = "timed out waiting for image to be created")
+
+    if tags:
+        try:
+            ec2.create_tags(image_id, tags)
+        except boto.exception.EC2ResponseError as e:
+            module.fail_json(msg = "Image tagging failed => %s: %s" % (e.error_code, e.error_message))
+
+    module.exit_json(msg="AMI creation operation complete", image_id=image_id, state=img.state, changed=True)
+
+
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
@@ -520,7 +704,16 @@ def main():
             state = dict(default='present'),
             device_mapping = dict(type='list'),
             tags = dict(type='dict'),
-            launch_permissions = dict(type='dict')
+            launch_permissions = dict(type='dict'),
+            snapshot_id = dict(),
+            architecture = dict(),
+            kernel_id = dict(),
+            root_device_name = dict(),
+            volumes = dict(type='list'),
+            virtualization_type = dict(),
+            sriov_net_support = dict(),
+            delete_root_volume_on_termination = dict(type="bool", default=False)
+
         )
     )
     module = AnsibleModule(argument_spec=argument_spec)
@@ -545,11 +738,17 @@ def main():
             update_image(module, ec2)
 
         # Changed is always set to true when provisioning new AMI
-        if not module.params.get('instance_id'):
-            module.fail_json(msg='instance_id parameter is required for new image')
         if not module.params.get('name'):
             module.fail_json(msg='name parameter is required for new image')
-        create_image(module, ec2)
+        if not module.params.get('instance_id') and not module.params.get('snapshot_id'):
+            module.fail_json(msg='instance_id or snapshot_id parameter is required for new image')
+        if module.params.get('instance_id'):
+            create_image(module, ec2)
+        elif module.params.get('snapshot_id'):
+            if not module.params.get('volumes'):
+                module.fail_json(msg='volumes parameter is required when creating image from snapshot_id')
+            register_image(module, ec2)
+
 
 
 # import module snippets
